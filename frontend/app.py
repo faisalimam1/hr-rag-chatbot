@@ -1,72 +1,47 @@
-﻿import streamlit as st
+"""
+Streamlit frontend to query the FastAPI backend.
+
+Usage (local):
+  streamlit run frontend/app.py
+"""
+import streamlit as st
 import requests
-import json
-from typing import List, Dict
+import os
 
-st.set_page_config(page_title='RAG HR Chatbot', layout='centered')
+BACKEND = os.getenv("BACKEND_URL", "http://localhost:8000")
 
-st.title('HR Policy Q&A — RAG Chatbot')
-st.write('Ask questions about the HR policy PDF. This app queries the local backend and shows provenance.')
+st.set_page_config(page_title="RAG Chatbot", layout="centered")
+st.title("RAG HR Chatbot — HR Policy Assistant")
 
-# Small helper
-def query_backend(q: str, top_k: int = 5) -> Dict:
-    url = 'http://127.0.0.1:8000/query'  # use loopback explicitly
-    payload = {'q': q, 'top_k': top_k}
-    headers = {'Content-Type': 'application/json'}
-    resp = requests.post(url, data=json.dumps(payload), headers=headers, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+st.write("Welcome! You can explore HR policies here. Type your question and I’ll find the answer from the document")
 
-with st.sidebar:
-    st.header('Settings')
-    top_k = st.number_input('Top K results', min_value=1, max_value=20, value=5)
-    show_embeddings = st.checkbox('Show embeddings (large)', value=False)
+q = st.text_input("Ask a question about the HR policy", placeholder="e.g. How many earned leaves do I get?")
 
-st.markdown('---')
-
-col1, col2 = st.columns([3,1])
-with col1:
-    query_text = st.text_input('Enter your HR question', value='How many earned leaves do I get?')
+col1, col2 = st.columns([3, 1])
 with col2:
-    if st.button('Ask'):
-        st.session_state['trigger'] = True
+    top_k = st.number_input("Top sources", min_value=1, max_value=10, value=5, step=1)
 
-# allow pressing Enter to trigger a run
-trigger = st.button('Run query (press Enter after typing)')
+if st.button("Ask") and q.strip():
+    with st.spinner("Contacting backend..."):
+        try:
+            resp = requests.post(f"{BACKEND}/query", json={"q": q, "top_k": int(top_k)}, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            st.error(f"Request failed: {e}")
+            st.stop()
 
-if 'trigger' not in st.session_state:
-    st.session_state['trigger'] = False
+    st.subheader("Answer")
+    st.write(data.get("answer", "No answer returned."))
 
-# run when user triggers either button or Enter
-if st.session_state['trigger'] or trigger:
-    if not query_text or not query_text.strip():
-        st.error('Please type a question first.')
-    else:
-        st.session_state['trigger'] = False
-        with st.spinner('Querying backend...'):
-            try:
-                result = query_backend(query_text, top_k=int(top_k))
-            except requests.exceptions.RequestException as re:
-                st.error(f'Backend request failed: {re}')
-            except Exception as e:
-                st.error(f'Unexpected error: {e}')
-            else:
-                # show the synthesized answer (or concatenated snippets)
-                st.subheader('Answer')
-                answer = result.get('answer') or 'No answer returned.'
-                st.write(answer)
+    st.subheader("Sources (provenance)")
+    for s in data.get("sources", []):
+        st.markdown(f"**ID:** `{s['id']}` — page {s.get('page')}, score: {s.get('score', 0):.3f}")
+        st.write(s.get("text", "")[:800] + ("..." if len(s.get("text", "")) > 800 else ""))
 
-                st.subheader('Sources (retrieved chunks)')
-                sources = result.get('sources') or []
-                if not sources:
-                    st.info('No chunks returned.')
-                else:
-                    for s in sources:
-                        st.markdown(f"**Page {s.get('page', 'N/A')} — score {s.get('score', 0):.4f}**")
-                        st.write(s.get('text', '')[:1000])
-                        if show_embeddings:
-                            st.write('Embedding length:', len(s.get('embedding', [])))
-                st.markdown('---')
+    st.caption(
+        f"Latency: {data.get('meta', {}).get('latency_ms', '?')} ms — cached: {data.get('meta', {}).get('cached')}"
+    )
 
-# small footer
-st.caption('Local demo — backed by a FAISS/NumPy index. Backend: http://127.0.0.1:8000')
+# --- Footer ---
+st.markdown("<p style='text-align: center; font-size: 14px;'>© Faisal Imam 2025</p>", unsafe_allow_html=True)
