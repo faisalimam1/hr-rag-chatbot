@@ -1,76 +1,118 @@
-﻿from fastapi import FastAPI, HTTPException
+"""
+FastAPI app for RAG HR Chatbot.
+
+Endpoints:
+  - GET /health
+  - POST /query { "q": "Your question", "top_k": 5 }
+
+Notes:
+  - Requires index built under index/
+  - Optional: set OPENAI_API_KEY to use OpenAI chat for answer generation.
+"""
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import os, json, traceback
+import time
+import os
+import json
+from embeddings.embed import get_embedding
+from index.faiss_utils import FAISSWrapper
+from reranker.rerank import rerank_candidates
+from backend.cache import LRUCache
 
-# local modules
+# Optional OpenAI for answer generation
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+if OPENAI_KEY:
+    try:
+        import openai
+        openai.api_key = OPENAI_KEY
+        _USE_OPENAI = True
+    except Exception:
+        _USE_OPENAI = False
+else:
+    _USE_OPENAI = False
+
+app = FastAPI(title="RAG HR Chatbot API")
+cache = LRUCache(max_size=1000)
+
+# load index on startup
 try:
-    from embeddings.embed import get_embedding
-except Exception:
-    get_embedding = None
+    faiss_wrapper = FAISSWrapper()
+except Exception as e:
+    faiss_wrapper = None
+    print("Warning: FAISS index not loaded:", e)
 
-try:
-    from index.faiss_utils import FAISSWrapper
-except Exception:
-    FAISSWrapper = None
-
-app = FastAPI(title="RAG HR Chatbot Backend")
-
-INDEX_DIR = os.path.join(os.path.dirname(__file__), "..", "index")
-EMB_PATH = os.path.abspath(os.path.join(INDEX_DIR, "embeddings.npy"))
-META_PATH = os.path.abspath(os.path.join(INDEX_DIR, "meta.json"))
-
-# Request model
 class QueryReq(BaseModel):
     q: str
     top_k: int = 5
 
-_faiss_wrapper = None
-def get_wrapper():
-    global _faiss_wrapper
-    if _faiss_wrapper is None:
-        if FAISSWrapper is None:
-            raise RuntimeError("Search backend missing. Ensure index/faiss_utils.py exists.")
-        _faiss_wrapper = FAISSWrapper()
-    return _faiss_wrapper
-
 @app.get("/health")
 def health():
-    try:
-        if not os.path.exists(META_PATH):
-            return {"ok": False, "error": "meta.json not found", "index_size": 0}
-        meta = json.load(open(META_PATH, "r", encoding="utf-8"))
-        return {"ok": True, "index_size": len(meta)}
-    except Exception as e:
-        traceback.print_exc()
-        return {"ok": False, "error": str(e), "index_size": 0}
+    return {"ok": True, "index_size": faiss_wrapper.index_size() if faiss_wrapper else 0}
 
 @app.post("/query")
 def query(req: QueryReq):
     if not req.q or not req.q.strip():
         raise HTTPException(status_code=400, detail="Empty query")
 
-    if get_embedding is None:
-        raise HTTPException(status_code=500, detail="Embedding backend not available")
+    q_text = req.q.strip()
+    cached = cache.get(q_text)
+    if cached:
+        cached["meta"]["cached"] = True
+        return cached
 
-    try:
-        q_emb = get_embedding(req.q)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding error: {e}")
+    if not faiss_wrapper:
+        raise HTTPException(status_code=500, detail="Search index not available. Build it first.")
 
-    try:
-        wrapper = get_wrapper()
-        hits = wrapper.search(q_emb, top_k=req.top_k)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search error: {e}")
+    t0 = time.time()
+    # 1) embed query
+    q_emb = get_embedding(q_text)
+    # 2) search top 20 candidates
+    candidates = faiss_wrapper.search(q_emb, top_k=20)
+    if len(candidates) == 0:
+        answer = "I could not find relevant policy text in the document."
+        payload = {"answer": answer, "sources": [], "score": 0.0, "meta": {"latency_ms": int((time.time()-t0)*1000)}}
+        cache.set(q_text, payload)
+        return payload
 
-    snippets = []
-    for h in hits:
-        snippets.append(f"(page {h.get('page')}) {h.get('text')[:400]}")
-    answer = "\n\n".join(snippets) if snippets else "No relevant policy text found."
+    # 3) rerank to top_k
+    reranked = rerank_candidates(q_text, candidates, q_emb, top_k=req.top_k)
+    # 4) prepare final prompt context (ids + short snippets)
+    context_texts = []
+    sources = []
+    for i, r in enumerate(reranked, start=1):
+        snippet = r["text"]
+        context_texts.append(f"[{i}] (id:{r['chunk_id']}) (page:{r['page']})\n{snippet}\n")
+        sources.append({"id": r["chunk_id"], "page": r["page"], "text": snippet, "score": r.get("combined_score", 0.0)})
 
-    return {
-        "query": req.q,
+    # 5) generate answer (OpenAI if available else fallback summary)
+    answer = None
+    if _USE_OPENAI:
+        system = "You are an HR assistant. Use only the provided policy excerpts to answer the user's question. If the policy does not contain an answer, say you could not find it and recommend escalation to HR."
+        user_prompt = f"CONTEXT:\n\n{''.join(context_texts)}\nQUESTION: {q_text}\n\nINSTRUCTIONS:\n- Answer concisely (2-4 sentences).\n- Cite the excerpt ids you used in parentheses at the end.\n"
+        try:
+            resp = openai.ChatCompletion.create(
+                model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.0,
+                max_tokens=512
+            )
+            answer = resp["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            answer = f"(LLM call failed) {e}"
+    else:
+        # simple deterministic fallback: combine best snippets + short summary
+        top_snippets = "\n\n".join([s["text"] for s in sources[:3]])
+        answer = f"Based on the policy excerpts: {top_snippets[:700].strip()}..."
+        answer = answer.replace("\n", " ")
+
+    payload = {
         "answer": answer,
-        "sources": hits,
-        "meta": {"top_k": req.top_k, "num_found": len(hits)}
+        "sources": sources,
+        "score": float(sum(s.get("score", 0.0) for s in reranked) / max(1, len(reranked))),
+        "meta": {"latency_ms": int((time.time()-t0)*1000), "cached": False}
     }
+    cache.set(q_text, payload)
+    return payload

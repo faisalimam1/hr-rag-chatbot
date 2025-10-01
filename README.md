@@ -142,8 +142,3 @@ Integrate LLMs safely for grounded answers.
 Deliver a full-stack solution (backend + frontend + Docker).
 
 Balance demo simplicity with production-readiness.
-
-
----
-
-Would you like me to also **bundle all the code + this README into a single `.zip` file** so you can just send it directly to your recruiter?

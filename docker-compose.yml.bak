@@ -1,0 +1,33 @@
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: faisalimam1/rag-hr-chatbot-backend:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./index:/app/index   # optional: persist FAISS index
+      - ./data:/app/data     # optional: HR docs
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    image: faisalimam1/rag-hr-chatbot-frontend:latest
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
+    environment:
+      - BACKEND_URL=http://backend:8000
+    restart: unless-stopped
+
+# optional network
+networks:
+  default:
+    name: rag-hr-net
