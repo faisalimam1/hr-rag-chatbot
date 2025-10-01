@@ -22,3 +22,5 @@ index/*.faiss
 
 # Streamlit cache
 .streamlit/
+
+# Jupyter Notebook checkpoints

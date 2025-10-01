@@ -1,4 +1,5 @@
-﻿from PyPDF2 import PdfReader
+﻿#sscripts
+from PyPDF2 import PdfReader
 import json, os, sys
 pdf_path = "data/hr_policy.pdf"
 out_dir = "data/extracted_text"
